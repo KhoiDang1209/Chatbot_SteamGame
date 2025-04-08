@@ -1,0 +1,9 @@
+pymongo
+streamlit
+sentence-transformers
+pandas
+re
+emoji
+nltk
+google-genai
+google

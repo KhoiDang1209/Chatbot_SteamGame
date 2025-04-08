@@ -12,7 +12,7 @@ load_dotenv("api.env")
 session_id = str(uuid.uuid4())
 
 st.set_page_config(page_title="Steam Game Recommender", page_icon="🎮")
-st.title("🎮 Ask me for Steam game recommendations!")
+st.title("🎮 Ask me for Any steam game!")
 
 # Initialize session state
 if "chat_history" not in st.session_state:
