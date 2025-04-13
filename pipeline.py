@@ -1,18 +1,18 @@
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
-import os
 from dotenv import load_dotenv
-import re
 from google.genai import types
 from google import genai
-from sentence_transformers import SentenceTransformer
+from datetime import datetime
+
+
 
 load_dotenv('api.env')
 
 
 class MongoDBConnection:
     def __init__(self, mongo_access):
-        self.mongo_access = os.environ.get("mongodb_access")
+        self.mongo_access = mongo_access
         # Create a new client and connect to the server
         self.client = MongoClient(mongo_access, server_api=ServerApi('1'))
         self.db = self.client["Steam_Game"]
@@ -43,62 +43,29 @@ class DataHandler:
         self.collection = collection
         self.embedding_model = embedding_model
 
-    @staticmethod
-    def extract_metadata_tags(text):
-        """
-        Extract metadata tags from user query including year, price, and review sentiment.
 
-        Args:
-            text (str): User query text
-
-        Returns:
-            dict: Dictionary of extracted tags
-        """
-        tags = {
-            "year": None,
-            "price": None,
-            "review": None
-        }
-        year_match = re.search(r"\b(19|20)\d{2}\b", text)
-        if year_match:
-            tags["year"] = int(year_match.group())
-
-        price_match = re.search(r"\$?(\d+)(\.\d{1,2})?", text)
-        if price_match:
-            tags["price"] = float(price_match.group(1))
-
-        for sentiment in ["Positive", "Mixed", "Negative"]:
-            if sentiment.lower() in text.lower():
-                tags["review"] = sentiment
-                break
-
-        return tags
-
-    def vector_search_description(self, limit=100):
-        """
-        Perform a vector search and filter results using extracted metadata.
-
-        Args:
-            limit (int): Maximum number of results to return
-
-        Returns:
-            list: Filtered results based on vector search and metadata
-        """
-        # Step 1: Extract metadata tags from user query
-        tags = DataHandler.extract_metadata_tags(self.user_query)
-
-        # Step 2: Generate embedding for the query
-        query_embedding = self.embedding_model.get_embedding(self.user_query)
+    def smart_vector_search(self,
+            query: str,
+            collection,
+            year_range: list[int] = None,
+            price_limit: float = None,
+            review_sentiment: str = None,
+            developer: str = None,
+            publisher: str = None,
+            limit: int = 100
+    ):
+        # Step 1: Embed the query
+        query_embedding = self.embedding_model.get_embedding(query)
         if not query_embedding:
-            return "Invalid query or embedding generation failed."
+            return []
 
-        # Step 3: Run vector search
+        # Step 2: Run vector search in MongoDB
         pipeline = [
             {
                 "$vectorSearch": {
-                    "index": "des_embed",
+                    "index": "default",
                     "queryVector": query_embedding,
-                    "path": "embedding_description",
+                    "path": "embedding",
                     "numCandidates": 400,
                     "limit": limit,
                 }
@@ -119,86 +86,43 @@ class DataHandler:
             }
         ]
 
-        results = list(self.collection.aggregate(pipeline))
+        results = list(collection.aggregate(pipeline))
 
+        # Step 3: Post-filter
         filtered_results = []
         for game in results:
-            # Check year
-            if tags["year"] is not None:
-                if not game.get("release_date") or game["release_date"].year != tags["year"]:
+            # Release year filtering
+            if year_range and isinstance(game.get("release_date"), datetime):
+                year = game["release_date"].year
+                if not (year_range[0] <= year <= year_range[1]):
                     continue
 
-            # Check price
-            if tags["price"] is not None:
-                if not game.get("price"):
-                    continue
+            # Price filtering
+            if price_limit is not None:
+                price_str = str(game.get("price", "")).replace("$", "").strip()
                 try:
-                    game_price = float(str(game["price"]).replace("$", "").strip())
-                    if game_price > tags["price"]:
+                    game_price = float(price_str)
+                    if game_price > price_limit:
                         continue
                 except ValueError:
-                    continue  # Skip games with malformed price
-
-            # Check review
-            if tags["review"]:
-                if not game.get("all_reviews") or tags["review"].lower() not in game["all_reviews"].lower():
                     continue
 
-            # If all filters pass
+            # Review sentiment filtering
+            if review_sentiment and review_sentiment.lower() not in game.get("all_reviews", "").lower():
+                continue
+
+            # Developer match
+            if developer and developer.lower() not in game.get("developer", "").lower():
+                continue
+
+            # Publisher match
+            if publisher and publisher.lower() not in game.get("publisher", "").lower():
+                continue
+
             filtered_results.append(game)
 
-        return filtered_results[:5] if filtered_results else results[:5]
+        return filtered_results[:3] if filtered_results else results[:3]
 
-    def vector_search_name(self, limit=1):
-        """
-        Perform a vector search in the MongoDB collection based on the game name.
-
-        Args:
-            limit (int): Maximum number of results to return
-
-        Returns:
-            list: Results of the vector search
-        """
-        # Generate embedding for the user query
-        query_embedding = self.embedding_model.get_embedding(self.user_query)
-
-        if not query_embedding:
-            return "Invalid query or embedding generation failed."
-
-        # Define the vector search pipeline
-        pipeline = [
-            {
-                "$vectorSearch": {
-                    "index": "name_embed",
-                    "queryVector": query_embedding,
-                    "path": "embedding_name",
-                    "numCandidates": 400,
-                    "limit": limit,
-                }
-            },
-            {
-                "$unset": "embedding"
-            },
-            {
-                "$project": {
-                    "_id": 0,
-                    "name": 1,  # Game name
-                    "description": 1,  # Game description
-                    "all_reviews": 1,  # Game review
-                    "release_date": 1,  # Release date
-                    "developer": 1,  # Developer name
-                    "publisher": 1,  # Publisher name
-                    "price": 1,  # Game price
-                    "score": {
-                        "$meta": "vectorSearchScore"
-                    }
-                }
-            }
-        ]
-
-        # Execute the search
-        results = list(self.collection.aggregate(pipeline))
-        return results
 
 
 class ModelResponse:
@@ -206,16 +130,6 @@ class ModelResponse:
         self.client = genai.Client(api_key=gemini_api_key)
 
     def generate_response(self, user_query, retrieved_games):
-        """
-        Generate a recommendation response using Gemini Flash API.
-
-        Args:
-            user_query (str): The original user query.
-            retrieved_games (list): List of game metadata dicts.
-
-        Returns:
-            str: The generated recommendation text.
-        """
         if not retrieved_games or isinstance(retrieved_games, str):
             return "Sorry, I couldn't find any games matching your query."
 
@@ -248,46 +162,73 @@ class ModelResponse:
         return response.text
 
     def process_response(self, user_query, collection, embedding_model):
-        """
-        Process Gemini Flash function call and generate final response.
 
-        Args:
-            user_query (str): The original user query.
-            collection: The MongoDB collection to search.
-            embedding_model: The embedding model to use for vector search.
-
-        Returns:
-            str: The generated recommendation text or error message.
-        """
         function_declarations = [
             {
-                "name": "vector_search_name",
-                "description": "Search games by their title or name similarity",
+                "name": "vector_search_filtered",
+                "description": "Search games based on description and apply filters like year range, price, review sentiment, developer, or publisher.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "User input that includes a game title or specific name"
+                            "description": "User's game preferences (e.g., football tactical game)"
+                        },
+                        "year_range": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "Optional release year range (e.g., [2020, 2024])"
+                        },
+                        "price_limit": {
+                            "type": "number",
+                            "description": "Maximum price (e.g., 10 for under $10)"
+                        },
+                        "review_sentiment": {
+                            "type": "string",
+                            "enum": ["Positive", "Mixed", "Negative"],
+                            "description": "Preferred review sentiment"
+                        },
+                        "developer": {
+                            "type": "string",
+                            "description": "Specific developer or studio name (e.g., 'Ubisoft')"
+                        },
+                        "publisher": {
+                            "type": "string",
+                            "description": "Specific publisher name (e.g., 'SEGA')"
                         }
                     },
                     "required": ["query"]
                 }
             },
             {
-                "name": "vector_search_description",
-                "description": "Search games based on genre, style, or gameplay description",
+                "name": "chit_chat",
+                "description": "Chit chat message of users",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "User input that includes preferences or genres"
+                            "description": "User input message that is common chit-chat"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "end_chat",
+                "description": "End chat session",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "End the chat session and further information if needed"
                         }
                     },
                     "required": ["query"]
                 }
             }
+
         ]
         tools = types.Tool(function_declarations=function_declarations)
         config = types.GenerateContentConfig(tools=[tools])
@@ -304,23 +245,30 @@ class ModelResponse:
             print(f"🔧 Function to call: {function_call.name}")
             print(f"📥 Arguments: {function_call.args}")
 
-            # Create a data handler with the query from function call
-            data_handler = DataHandler(
-                function_call.args["query"],
-                collection,
-                embedding_model
-            )
-
-            if function_call.name == "vector_search_name":
-                results = data_handler.vector_search_name()
-            elif function_call.name == "vector_search_description":
-                results = data_handler.vector_search_description()
+            if function_call.name == "vector_search_filtered":
+                args = function_call.args
+                data_handler= DataHandler(user_query, collection, embedding_model)
+                results = data_handler.smart_vector_search(
+                    query=user_query,
+                    collection=collection,
+                    year_range=args.get("year_range"),
+                    price_limit=args.get("price_limit"),
+                    review_sentiment=args.get("review_sentiment"),
+                    developer=args.get("developer"),
+                    publisher=args.get("publisher")
+                )
+            elif function_call.name == "chit-chat":
+                chit_chat_response = self.client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=function_call.args["query"],
+                )
+                return chit_chat_response.text
             else:
-                return "❌ Unknown function"
+                end_response = self.client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=function_call.args["query"],
+                )
+                return end_response.text
 
-            return self.generate_response(user_query, results)
-        else:
-            print("⚠️ No function call found.")
-            if hasattr(candidate.content.parts[0], "text"):
-                return candidate.content.parts[0].text
-            return "No appropriate response found."
+            # Use local model to generate the response
+            return ModelResponse.generate_response(self,user_query, results)
